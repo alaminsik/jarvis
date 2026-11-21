@@ -35,6 +35,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import android.widget.Toast
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -93,8 +94,19 @@ class JarvisService : Service() {
     private var running = false
     private var awakeUntil = 0L
     private var torchOn = false
+    private var listening = false
+    private var listenStart = 0L
 
-    private val WAKE = listOf("জার্ভিস", "জারভিস", "জার্বিস", "জারবিস", "jarvis")
+    companion object { @Volatile var lastHeard: String = "" }
+
+    private val BASE_WAKE = listOf(
+        "জার্ভিস", "জারভিস", "জার্বিস", "জারবিস", "জার্ভিশ", "জারভিশ", "জার্ভিজ", "জারভিজ", "jarvis"
+    )
+
+    private fun wakeWords(): List<String> {
+        val extra = getSharedPreferences("jv", Context.MODE_PRIVATE).getString("names", "") ?: ""
+        return BASE_WAKE + extra.split(",", "،").map { norm(it) }.filter { it.length >= 2 }
+    }
 
     private val APPS: List<Pair<List<String>, String>> = listOf(
         listOf("ফেসবুক", "ফেইসবুক", "facebook") to "com.facebook.katana",
@@ -162,6 +174,7 @@ class JarvisService : Service() {
         if (!ttsOk) return
         speaking = true
         try { sr?.cancel() } catch (e: Exception) {}
+        listening = false
         tts.speak(t, TextToSpeech.QUEUE_FLUSH, null, "u" + System.nanoTime())
     }
 
@@ -170,16 +183,34 @@ class JarvisService : Service() {
 
     private fun startListen() {
         if (!running || speaking) return
+        if (listening && System.currentTimeMillis() - listenStart < 12000) return
         if (sr == null) {
             sr = SpeechRecognizer.createSpeechRecognizer(this)
             sr!!.setRecognitionListener(object : RecognitionListener {
                 override fun onResults(b: Bundle?) {
+                    listening = false
                     val l = b?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
-                    if (!l.isNullOrEmpty()) route(l[0], false)
-                    restart(300)
+                    if (!l.isNullOrEmpty()) {
+                        val ww = wakeWords()
+                        val pick = l.firstOrNull { c ->
+                            val n = norm(c)
+                            ww.any { n.contains(it) }
+                        } ?: l[0]
+                        lastHeard = pick
+                        Toast.makeText(this@JarvisService, "শুনলাম: " + pick, Toast.LENGTH_SHORT).show()
+                        route(pick, false)
+                    }
+                    restart(100)
                 }
                 override fun onError(e: Int) {
-                    restart(if (e == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) 1500 else 600)
+                    listening = false
+                    restart(
+                        when (e) {
+                            SpeechRecognizer.ERROR_NO_MATCH, SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> 100L
+                            SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> 800L
+                            else -> 500L
+                        }
+                    )
                 }
                 override fun onReadyForSpeech(p: Bundle?) {}
                 override fun onBeginningOfSpeech() {}
@@ -193,7 +224,13 @@ class JarvisService : Service() {
         val i = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "bn-BD")
-        try { sr!!.cancel(); sr!!.startListening(i) } catch (e: Exception) { restart(1500) }
+            .putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+            .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            .putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 1800L)
+            .putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+        listening = true
+        listenStart = System.currentTimeMillis()
+        try { sr!!.startListening(i) } catch (e: Exception) { listening = false; restart(1500) }
     }
 
     /* ---------- সাহায্যকারী ---------- */
@@ -300,9 +337,10 @@ class JarvisService : Service() {
     /* ---------- কমান্ড রাউটার ---------- */
     private fun route(raw: String, bypass: Boolean) {
         var t = norm(raw)
-        val woke = WAKE.any { t.contains(it) }
+        val ww = wakeWords()
+        val woke = ww.any { t.contains(it) }
         if (!bypass && !woke && System.currentTimeMillis() > awakeUntil) return
-        for (w in WAKE) t = t.replace(w, " ")
+        for (w in ww) t = t.replace(w, " ")
         t = t.replace(Regex("\\s+"), " ").trim()
         awakeUntil = 0
         if (t.isEmpty()) { awakeUntil = System.currentTimeMillis() + 8000; say("জি, বলুন"); return }
@@ -425,6 +463,28 @@ class MainActivity : Activity() {
             }
         }
 
+        val nameBox = EditText(this)
+        nameBox.hint = "ডাকার নাম (বাংলায়; একাধিক বানান কমা দিয়ে)"
+        nameBox.setText(getSharedPreferences("jv", Context.MODE_PRIVATE).getString("names", ""))
+        l.addView(nameBox)
+        btn("নাম সেভ করো") {
+            getSharedPreferences("jv", Context.MODE_PRIVATE).edit()
+                .putString("names", nameBox.text.toString()).apply()
+            Toast.makeText(this, "নাম সেভ হয়েছে", Toast.LENGTH_SHORT).show()
+        }
+
+        val heard = TextView(this)
+        heard.textSize = 16f
+        heard.setPadding(0, 30, 0, 0)
+        l.addView(heard)
+        val hh = Handler(Looper.getMainLooper())
+        hh.post(object : Runnable {
+            override fun run() {
+                heard.text = "শেষ শোনা কথা: " + JarvisService.lastHeard
+                hh.postDelayed(this, 700)
+            }
+        })
+
         val sv = ScrollView(this)
         sv.addView(l)
         setContentView(sv)
@@ -445,9 +505,8 @@ class MainActivity : Activity() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
             startForegroundService(Intent(this, JarvisService::class.java))
         } else {
-            Toast_("মাইকের অনুমতি দিন")
+            Toast.makeText(this, "মাইকের অনুমতি দিন", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun Toast_(s: String) { android.widget.Toast.makeText(this, s, android.widget.Toast.LENGTH_LONG).show() }
 }
